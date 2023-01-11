@@ -15,7 +15,9 @@ import one.nio.server.AcceptorConfig;
 import one.nio.server.RejectedSessionException;
 import one.nio.server.SelectorThread;
 import one.nio.util.Base64;
+import one.nio.util.ByteArrayBuilder;
 import one.nio.util.Hash;
+import one.nio.util.Utf8;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,6 +28,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
@@ -58,6 +61,9 @@ public class MyHttpServer extends HttpServer {
     private final HttpClient client;
     public static final int TIMEOUT_EXECUTOR = 10;
     public static final int CLIENT_EXECUTOR_THREADS = 2;
+    private static final char DELIMETER = '\n';
+    private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] EOF = "0\r\n\r\n".getBytes(StandardCharsets.UTF_8);
 
     public MyHttpServer(ServiceConfig config) throws IOException {
         super(createConfigFromPort(config.selfPort()));
@@ -105,13 +111,33 @@ public class MyHttpServer extends HttpServer {
             @Override
             protected void writeResponse(Response response, boolean includeBody) throws IOException {
                 if (response instanceof ChunkedResponse) {
-                    MyQueueItem item = new MyQueueItem((ChunkedResponse) response);
-                    super.write(item);
+                    super.writeResponse(response, false);
+                    Iterator<Entry<String>> data = ((ChunkedResponse) response).getData();
+                    while (data.hasNext()) {
+                        byte[] bytes = getBytesOfData(data.next());
+                        super.write(bytes, 0, bytes.length);
+                    }
+                    super.write(EOF, 0, EOF.length);
                 } else {
                     super.writeResponse(response, includeBody);
                 }
             }
         };
+    }
+
+    private byte[] getBytesOfData(Entry<String> entry) {
+        byte[] keyBytes = Utf8.toBytes(entry.key());
+        byte[] valueBytes = Base64.decodeFromChars(entry.value().toCharArray());
+        int length = keyBytes.length + valueBytes.length + 1;
+        ByteArrayBuilder bytesBuilder = new ByteArrayBuilder();
+        bytesBuilder
+                .append(Utf8.toBytes(Integer.toHexString(length)))
+                .append(CRLF)
+                .append(keyBytes)
+                .append(DELIMETER)
+                .append(valueBytes)
+                .append(CRLF);
+        return bytesBuilder.toBytes();
     }
 
     @Override
@@ -215,8 +241,6 @@ public class MyHttpServer extends HttpServer {
                     }
 
                     if (curSuccess >= ack && requestHandled.compareAndSet(false, true)) {
-                        logger.debug("success handle request {} {} for key {}, from = {}", request.getMethod(),
-                                config.selfPort(), id, from);
                         if (request.getMethod() == Request.METHOD_GET) {
                             int countNotFound = 0;
                             long freshestEntryTimestamp = -1;
@@ -252,13 +276,9 @@ public class MyHttpServer extends HttpServer {
                             String responseStatusCode =
                                     getResponseStatusCode(responseArray.get(anyIndex).getStatus());
                             Response response =
-                                new Response(responseStatusCode, responseArray.get(anyIndex).getBody());
+                                    new Response(responseStatusCode, responseArray.get(anyIndex).getBody());
                             sendResponse(session, response);
                         }
-                    } else {
-                        logger.debug("waiting handle request {} {} for key {}, from = {}, curSuccess = {},"
-                                        + " ack ={}, reqHan= {} ", request.getMethod(), config.selfPort(), id, from,
-                                curSuccess, ack, requestHandled.get());
                     }
                 }, aggregatorExecutor);
             }
