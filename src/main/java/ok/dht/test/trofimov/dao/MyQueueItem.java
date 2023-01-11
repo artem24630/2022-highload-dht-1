@@ -14,12 +14,17 @@ public class MyQueueItem extends Session.ArrayQueueItem {
     private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.UTF_8);
     private static final byte[] EOF = "0\r\n\r\n".getBytes(StandardCharsets.UTF_8);
     private final ChunkedResponse chunkedResponse;
-    private boolean lastChunkSent;
+    private boolean isEnd;
     private boolean headersSent;
 
     public MyQueueItem(ChunkedResponse response) {
         super(new byte[0], 0, 0, 0);
         this.chunkedResponse = response;
+    }
+
+    @Override
+    public int remaining() {
+        return isEnd && (written == count) ? 0 : 1;
     }
 
     @Override
@@ -32,15 +37,13 @@ public class MyQueueItem extends Session.ArrayQueueItem {
                     count = data.length;
                     written = 0;
                     writeToSocket(socket);
-                } else if (lastChunkSent) {
-                    next = null;
                 } else {
                     data = EOF;
                     offset = 0;
                     count = EOF.length;
                     written = 0;
                     writeToSocket(socket);
-                    lastChunkSent = true;
+                    isEnd = true;
                 }
             } else {
                 writeToSocket(socket);
@@ -51,7 +54,6 @@ public class MyQueueItem extends Session.ArrayQueueItem {
             count = data.length;
             written = 0;
             writeToSocket(socket);
-            next = this;
             headersSent = true;
         }
         return written;
