@@ -10,9 +10,7 @@ import one.nio.http.HttpSession;
 import one.nio.http.Request;
 import one.nio.http.Response;
 import one.nio.net.Session;
-import one.nio.net.Socket;
 import one.nio.server.AcceptorConfig;
-import one.nio.server.RejectedSessionException;
 import one.nio.server.SelectorThread;
 import one.nio.util.Base64;
 import one.nio.util.ByteArrayBuilder;
@@ -105,26 +103,6 @@ public class MyHttpServer extends HttpServer {
         session.sendResponse(response);
     }
 
-    @Override
-    public HttpSession createSession(Socket socket) throws RejectedSessionException {
-        return new HttpSession(socket, this) {
-            @Override
-            protected void writeResponse(Response response, boolean includeBody) throws IOException {
-                if (response instanceof ChunkedResponse) {
-                    super.writeResponse(response, false);
-                    Iterator<Entry<String>> data = ((ChunkedResponse) response).getData();
-                    while (data.hasNext()) {
-                        byte[] bytes = getBytesOfData(data.next());
-                        super.write(bytes, 0, bytes.length);
-                    }
-                    super.write(EOF, 0, EOF.length);
-                } else {
-                    super.writeResponse(response, includeBody);
-                }
-            }
-        };
-    }
-
     private byte[] getBytesOfData(Entry<String> entry) {
         byte[] keyBytes = Utf8.toBytes(entry.key());
         byte[] valueBytes = Base64.decodeFromChars(entry.value().toCharArray());
@@ -156,17 +134,47 @@ public class MyHttpServer extends HttpServer {
             return;
         }
         String end = request.getParameter("end=");
+
         requestsExecutor.execute(() -> {
             try {
                 Iterator<Entry<String>> iterator = dao.get(start, end);
-                ChunkedResponse response = new ChunkedResponse(Response.OK, iterator);
-                sendResponse(session, response);
+                ChunkedResponse response = new ChunkedResponse(Response.OK, null);
+                String connection = request.getHeader("Connection:");
+                boolean keepAlive = request.isHttp11()
+                        ? !"close".equalsIgnoreCase(connection)
+                        : "Keep-Alive".equalsIgnoreCase(connection);
+                response.addHeader(keepAlive ? "Connection: Keep-Alive" : "Connection: close");
+                byte[] bytes = response.toBytes(false);
+                session.write(bytes, 0, bytes.length);
+                requestsExecutor.execute(() -> wrapperProcessChunk(session, iterator));
             } catch (IOException e) {
                 logger.error("Error while handling range request for keys start={}, end={}", start, end, e);
                 sendResponse(session, new Response(Response.INTERNAL_ERROR, Response.EMPTY));
             }
-
         });
+    }
+
+    private void wrapperProcessChunk(HttpSession session, Iterator<Entry<String>> iterator) {
+        try {
+            if (processChunk(session, iterator)) {
+                requestsExecutor.execute(() -> wrapperProcessChunk(session, iterator));
+            }
+        } catch (IOException e) {
+            logger.error("wrapperProcessChunk", e);
+            sendResponse(session, new Response(Response.INTERNAL_ERROR, Response.EMPTY));
+        }
+    }
+    
+    private boolean processChunk(Session session, Iterator<Entry<String>> iterator) throws IOException {
+        if (iterator.hasNext()) {
+            byte[] bytes = getBytesOfData(iterator.next());
+            session.write(bytes, 0, bytes.length);
+            return true;
+        } else {
+            session.write(EOF, 0, EOF.length);
+            session.scheduleClose();
+            return false;
+        }
     }
 
     private void handleSingleKeyRequest(Request request, HttpSession session) {
